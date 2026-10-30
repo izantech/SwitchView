@@ -1,14 +1,30 @@
-// Elgato capture: V4L2 video (mmap, newest-frame-wins) + ALSA audio.
+// SwitchView capture interface:
+// - On Linux: V4L2 video (mmap, newest-frame-wins) + ALSA audio.
+// - On Windows: Windows Media Foundation (IMFSourceReader) + SDL2 audio (WASAPI),
+//   with built-in synthetic test pattern generator fallback.
+
 #ifndef SV_CAPTURE_H
 #define SV_CAPTURE_H
 
 #include <SDL2/SDL.h>
 #include <stdint.h>
 
+// Pixel formats (FourCC)
+#define SV_FMT_NV12 0x3231564e  // 'NV12'
+#define SV_FMT_YUYV 0x56595559  // 'YUYV'
+
+// Compatibility aliases for code previously expecting V4L2 macro names
+#ifndef V4L2_PIX_FMT_NV12
+#define V4L2_PIX_FMT_NV12 SV_FMT_NV12
+#endif
+#ifndef V4L2_PIX_FMT_YUYV
+#define V4L2_PIX_FMT_YUYV SV_FMT_YUYV
+#endif
+
 struct capture_opts {
   const char *video_dev, *audio_dev;
   int width, height, fps;
-  unsigned fourcc;  // V4L2_PIX_FMT_NV12 or V4L2_PIX_FMT_YUYV
+  unsigned fourcc;  // SV_FMT_NV12 or SV_FMT_YUYV
   int no_audio;
   int audio_max_ms;  // drop input beyond this much queued output
 };

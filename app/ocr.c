@@ -1,23 +1,30 @@
 #include "ocr.h"
 
+#if __has_include("compat/platform.h")
+#include "compat/platform.h"
+#else
+#include "platform.h"
+#endif
+
 #include <SDL2/SDL.h>
 #include <ctype.h>
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef HAVE_TESSERACT
 #include <tesseract/capi.h>
-#include <unistd.h>
+#endif
 
 #define TEXT_MAX 8192
 
 struct ocr {
   struct capture *cap;
-  pthread_t th;
+  SDL_Thread *th;
   atomic_int running, enabled;
 
-  pthread_mutex_t lock;  // guards region and result
+  SDL_mutex *lock;  // guards region and result
   float rx, ry, rw, rh;
   char text[TEXT_MAX];
   unsigned seq;
@@ -28,6 +35,7 @@ struct ocr {
   atomic_uint busy_since;
 };
 
+#ifdef HAVE_TESSERACT
 // Lower-case and collapse whitespace so rules can match loosely.
 static void normalize(const char *in, char *out, size_t len)
 {
@@ -45,15 +53,14 @@ static void normalize(const char *in, char *out, size_t len)
   if (n && out[n - 1] == ' ') n--;
   out[n] = 0;
 }
-
-static void *ocr_thread(void *arg)
+static int SDLCALL ocr_thread(void *arg)
 {
   struct ocr *o = arg;
   TessBaseAPI *api = TessBaseAPICreate();
   if (TessBaseAPIInit3(api, NULL, "eng") != 0) {
     fprintf(stderr, "ocr: tesseract init failed (is tesseract-ocr-eng installed?)\n");
     TessBaseAPIDelete(api);
-    return NULL;
+    return 0;
   }
   // Sparse text: game/console UIs are scattered labels, not paragraphs.
   TessBaseAPISetPageSegMode(api, PSM_SPARSE_TEXT);
@@ -61,12 +68,17 @@ static void *ocr_thread(void *arg)
 
   unsigned w = capture_width(o->cap), h = capture_height(o->cap);
   uint8_t *frame = malloc((size_t)w * h);
+  if (!frame) {
+    TessBaseAPIEnd(api);
+    TessBaseAPIDelete(api);
+    return 0;
+  }
   unsigned last_seq = 0;
   char raw_norm[TEXT_MAX];
   static struct ocr_box boxes[OCR_MAX_BOXES];
 
   while (atomic_load(&o->running)) {
-    if (!atomic_load(&o->enabled)) { usleep(20000); continue; }
+    if (!atomic_load(&o->enabled)) { sv_usleep(20000); continue; }
 
     uint32_t started = SDL_GetTicks();
     atomic_store(&o->busy_since, started);
@@ -77,14 +89,14 @@ static void *ocr_thread(void *arg)
     for (int i = 0; i < 100 && atomic_load(&o->running); i++) {
       seq = capture_copy_luma(o->cap, frame);
       if (seq && seq != last_seq) break;
-      usleep(5000);
+      sv_usleep(5000);
     }
     if (!seq || seq == last_seq) { atomic_store(&o->busy, 0); continue; }
     last_seq = seq;
 
-    pthread_mutex_lock(&o->lock);
+    SDL_LockMutex(o->lock);
     float rx = o->rx, ry = o->ry, rw = o->rw, rh = o->rh;
-    pthread_mutex_unlock(&o->lock);
+    SDL_UnlockMutex(o->lock);
 
     TessBaseAPISetImage(api, frame, (int)w, (int)h, 1, (int)w);
     if (rw > 0 && rh > 0)
@@ -121,33 +133,44 @@ static void *ocr_thread(void *arg)
     }
     TessBaseAPIClear(api);
 
-    pthread_mutex_lock(&o->lock);
+    SDL_LockMutex(o->lock);
     memcpy(o->text, raw_norm, sizeof o->text);
     memcpy(o->boxes, boxes, sizeof(boxes[0]) * (size_t)nb);
     o->nboxes = nb;
     o->seq++;
     o->started_ms = started;
-    pthread_mutex_unlock(&o->lock);
+    SDL_UnlockMutex(o->lock);
     atomic_store(&o->busy, 0);
   }
 
   free(frame);
   TessBaseAPIEnd(api);
   TessBaseAPIDelete(api);
-  return NULL;
+  return 0;
 }
+#endif
 
 struct ocr *ocr_create(struct capture *cap)
 {
   struct ocr *o = calloc(1, sizeof *o);
+  if (!o) return NULL;
   o->cap = cap;
-  pthread_mutex_init(&o->lock, NULL);
-  atomic_store(&o->running, 1);
-  if (pthread_create(&o->th, NULL, ocr_thread, o) != 0) {
-    pthread_mutex_destroy(&o->lock);
+  o->lock = SDL_CreateMutex();
+  if (!o->lock) {
     free(o);
     return NULL;
   }
+  atomic_store(&o->running, 1);
+#ifdef HAVE_TESSERACT
+  o->th = SDL_CreateThread(ocr_thread, "ocr", o);
+  if (!o->th) {
+    SDL_DestroyMutex(o->lock);
+    free(o);
+    return NULL;
+  }
+#else
+  fprintf(stderr, "ocr: running without Tesseract engine (stub mode)\n");
+#endif
   return o;
 }
 
@@ -155,45 +178,66 @@ void ocr_destroy(struct ocr *o)
 {
   if (!o) return;
   atomic_store(&o->running, 0);
-  pthread_join(o->th, NULL);
-  pthread_mutex_destroy(&o->lock);
+#ifdef HAVE_TESSERACT
+  if (o->th) SDL_WaitThread(o->th, NULL);
+#endif
+  if (o->lock) SDL_DestroyMutex(o->lock);
   free(o);
 }
 
-void ocr_set_enabled(struct ocr *o, int on) { atomic_store(&o->enabled, on); }
+void ocr_set_enabled(struct ocr *o, int on)
+{
+  if (o) atomic_store(&o->enabled, on);
+}
 
 void ocr_set_region(struct ocr *o, float x, float y, float w, float h)
 {
-  pthread_mutex_lock(&o->lock);
+  if (!o) return;
+  SDL_LockMutex(o->lock);
   o->rx = x; o->ry = y; o->rw = w; o->rh = h;
-  pthread_mutex_unlock(&o->lock);
+  SDL_UnlockMutex(o->lock);
 }
 
 unsigned ocr_latest(struct ocr *o, char *buf, size_t len, uint32_t *started_ms)
 {
-  pthread_mutex_lock(&o->lock);
+  if (!o) {
+    if (buf && len) *buf = '\0';
+    return 0;
+  }
+  SDL_LockMutex(o->lock);
   unsigned seq = o->seq;
   if (buf && len) snprintf(buf, len, "%s", o->text);
   if (started_ms) *started_ms = o->started_ms;
-  pthread_mutex_unlock(&o->lock);
+  SDL_UnlockMutex(o->lock);
   return seq;
 }
 
 unsigned ocr_boxes(struct ocr *o, struct ocr_box *out, int max, int *n)
 {
-  pthread_mutex_lock(&o->lock);
+  if (!o) {
+    if (n) *n = 0;
+    return 0;
+  }
+  SDL_LockMutex(o->lock);
   int k = o->nboxes < max ? o->nboxes : max;
-  memcpy(out, o->boxes, sizeof(out[0]) * (size_t)k);
+  if (out && k > 0) memcpy(out, o->boxes, sizeof(out[0]) * (size_t)k);
   unsigned seq = o->seq;
-  pthread_mutex_unlock(&o->lock);
-  *n = k;
+  SDL_UnlockMutex(o->lock);
+  if (n) *n = k;
   return seq;
 }
 
 int ocr_busy(struct ocr *o, uint32_t *since_ms)
 {
+  if (!o) {
+    if (since_ms) *since_ms = 0;
+    return 0;
+  }
   if (since_ms) *since_ms = atomic_load(&o->busy_since);
   return atomic_load(&o->busy);
 }
 
-int ocr_enabled(struct ocr *o) { return atomic_load(&o->enabled); }
+int ocr_enabled(struct ocr *o)
+{
+  return o ? atomic_load(&o->enabled) : 0;
+}

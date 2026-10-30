@@ -2,19 +2,32 @@
 #include "switchview_proto.h"
 
 #include <SDL2/SDL.h>
-#include <dirent.h>
+
+#if __has_include("compat/platform.h")
+#include "compat/platform.h"
+#else
+#include "platform.h"
+#endif
+
+#if __has_include("compat/dirent.h")
+#include "compat/dirent.h"
+#else
+#include "dirent.h"
+#endif
+
 #include <lauxlib.h>
 #include <lua.h>
 #include <lualib.h>
-#include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <ctype.h>
+#ifndef _WIN32
 #include <unistd.h>
+#include <strings.h>
+#endif
 
 #define MAX_SCRIPTS 64
 #define MAX_RULES 64
@@ -30,13 +43,13 @@ struct rule {
 struct script {
   struct ocr *ocr;
   char dir[1024];
-  char names[MAX_SCRIPTS][128];
+  char names[MAX_SCRIPTS][260];
   int count;
 
-  pthread_t th;
+  SDL_Thread *th;
   atomic_int running, stop;
 
-  pthread_mutex_t lock;  // guards everything below
+  SDL_mutex *lock;  // guards everything below
   struct link_state input;
   char textq[1024];
   size_t textq_len;
@@ -45,7 +58,7 @@ struct script {
   int log_head, log_count;
   struct rule rules[MAX_RULES];
   int nrules;
-  char path[1200];
+  char path[1300];
   char hl[MAX_RULE_WORDS][64];
   int nhl;
   atomic_int leds;
@@ -74,12 +87,12 @@ static void logf_(struct script *s, const char *fmt, ...)
   vsnprintf(line, sizeof line, fmt, ap);
   va_end(ap);
   fprintf(stderr, "script: %s\n", line);
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   int idx = (s->log_head + s->log_count) % SCRIPT_LOG_LINES;
   if (s->log_count == SCRIPT_LOG_LINES) s->log_head = (s->log_head + 1) % SCRIPT_LOG_LINES;
   else s->log_count++;
   snprintf(s->log[idx], SCRIPT_LOG_COLS, "%s", line);
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
 }
 
 static struct script *self(lua_State *L)
@@ -96,7 +109,7 @@ static void nap(lua_State *L, struct script *s, double seconds)
   uint32_t end = SDL_GetTicks() + (uint32_t)(seconds * 1000);
   while ((int32_t)(end - SDL_GetTicks()) > 0) {
     if (atomic_load(&s->stop)) luaL_error(L, "stopped");
-    usleep(5000);
+    sv_usleep(5000);
   }
   if (atomic_load(&s->stop)) luaL_error(L, "stopped");
 }
@@ -127,7 +140,7 @@ static const char *classify(struct script *s, const char *text)
 {
   static char squashed[8192];  // script thread only
   squash(text, squashed, sizeof squashed);
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   const char *label = "unknown";
   for (int i = 0; i < s->nrules; i++) {
     int all = 1;
@@ -141,7 +154,7 @@ static const char *classify(struct script *s, const char *text)
     }
   }
   snprintf(s->screen, sizeof s->screen, "%s", label);
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
   return label;
 }
 
@@ -180,9 +193,9 @@ static int l_press(lua_State *L)
 {
   struct script *s = self(L);
   uint32_t bits = button_bits(L, 1);
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   s->input.buttons |= bits;
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
   return 0;
 }
 
@@ -190,9 +203,9 @@ static int l_release(lua_State *L)
 {
   struct script *s = self(L);
   uint32_t bits = lua_gettop(L) ? button_bits(L, 1) : 0xffffffffu;
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   s->input.buttons &= ~bits;
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
   return 0;
 }
 
@@ -200,126 +213,173 @@ static int l_release(lua_State *L)
 static int l_tap(lua_State *L)
 {
   struct script *s = self(L);
-  double hold = DEFAULT_HOLD;
   int top = lua_gettop(L);
-  if (top && lua_type(L, top) == LUA_TNUMBER) { hold = lua_tonumber(L, top); lua_pop(L, 1); }
-  uint32_t bits = button_bits(L, 1);
-  pthread_mutex_lock(&s->lock);
+  double hold = DEFAULT_HOLD;
+  if (top >= 2 && lua_type(L, top) == LUA_TNUMBER) {
+    hold = lua_tonumber(L, top);
+    top--;
+  }
+  uint32_t bits = 0;
+  for (int i = 1; i <= top; i++) {
+    const char *n = luaL_checkstring(L, i);
+    unsigned k;
+    for (k = 0; k < sizeof BUTTONS / sizeof BUTTONS[0]; k++)
+      if (!strcasecmp(n, BUTTONS[k].name)) { bits |= BUTTONS[k].bit; break; }
+    if (k == sizeof BUTTONS / sizeof BUTTONS[0]) return luaL_error(L, "unknown button '%s'", n);
+  }
+  SDL_LockMutex(s->lock);
   s->input.buttons |= bits;
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
   nap(L, s, hold);
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   s->input.buttons &= ~bits;
-  pthread_mutex_unlock(&s->lock);
-  nap(L, s, 0.05);  // let the release register before the next input
+  SDL_UnlockMutex(s->lock);
+  nap(L, s, 0.05);  // gap before next action
   return 0;
 }
 
-// dpad("right") holds; dpad("right", 0.1) taps; dpad("center") releases.
+// dpad("up") / dpad("down", 0.2) / dpad() releases
 static int l_dpad(lua_State *L)
 {
   struct script *s = self(L);
+  if (lua_gettop(L) == 0) {
+    SDL_LockMutex(s->lock);
+    s->input.hat = SV_HAT_CENTER;
+    SDL_UnlockMutex(s->lock);
+    return 0;
+  }
   const char *d = luaL_checkstring(L, 1);
-  int hat = -1;
+  double hold = lua_gettop(L) >= 2 ? luaL_checknumber(L, 2) : 0;
+  uint8_t hat = 0xff;
   for (unsigned k = 0; k < sizeof HATS / sizeof HATS[0]; k++)
     if (!strcasecmp(d, HATS[k].name)) hat = HATS[k].hat;
-  if (hat < 0) return luaL_error(L, "unknown direction '%s'", d);
-  pthread_mutex_lock(&s->lock);
-  s->input.hat = (uint8_t)hat;
-  pthread_mutex_unlock(&s->lock);
-  if (lua_isnumber(L, 2)) {
-    nap(L, s, lua_tonumber(L, 2));
-    pthread_mutex_lock(&s->lock);
+  if (hat == 0xff) return luaL_error(L, "unknown hat '%s'", d);
+  SDL_LockMutex(s->lock);
+  s->input.hat = hat;
+  SDL_UnlockMutex(s->lock);
+  if (hold > 0) {
+    nap(L, s, hold);
+    SDL_LockMutex(s->lock);
     s->input.hat = SV_HAT_CENTER;
-    pthread_mutex_unlock(&s->lock);
+    SDL_UnlockMutex(s->lock);
     nap(L, s, 0.05);
   }
   return 0;
 }
 
-static int16_t axis(double v)
-{
-  if (v > 1) v = 1;
-  if (v < -1) v = -1;
-  return (int16_t)(v * 32767);
-}
-
-// stick("l", x, y [, seconds]); x/y in -1..1, y up. With seconds it recentres.
+// stick("left", x, y) / stick("right", x, y, hold_s)
 static int l_stick(lua_State *L)
 {
   struct script *s = self(L);
   const char *which = luaL_checkstring(L, 1);
-  int16_t x = axis(luaL_checknumber(L, 2)), y = axis(luaL_checknumber(L, 3));
-  int right = which[0] == 'r' || which[0] == 'R';
-  pthread_mutex_lock(&s->lock);
-  if (right) { s->input.rx = x; s->input.ry = y; } else { s->input.lx = x; s->input.ly = y; }
-  pthread_mutex_unlock(&s->lock);
-  if (lua_isnumber(L, 4)) {
-    nap(L, s, lua_tonumber(L, 4));
-    pthread_mutex_lock(&s->lock);
-    if (right) s->input.rx = s->input.ry = 0; else s->input.lx = s->input.ly = 0;
-    pthread_mutex_unlock(&s->lock);
+  double fx = luaL_checknumber(L, 2), fy = luaL_checknumber(L, 3);
+  double hold = lua_gettop(L) >= 4 ? luaL_checknumber(L, 4) : 0;
+  int16_t x = (int16_t)(fx * 32767.0);
+  int16_t y = (int16_t)(fy * 32767.0);
+  int is_left = !strcasecmp(which, "left") || !strcasecmp(which, "l");
+  int is_right = !strcasecmp(which, "right") || !strcasecmp(which, "r");
+  if (!is_left && !is_right) return luaL_error(L, "stick: expected 'left' or 'right'");
+  SDL_LockMutex(s->lock);
+  if (is_left) { s->input.lx = x; s->input.ly = y; }
+  else { s->input.rx = x; s->input.ry = y; }
+  SDL_UnlockMutex(s->lock);
+  if (hold > 0) {
+    nap(L, s, hold);
+    SDL_LockMutex(s->lock);
+    if (is_left) { s->input.lx = 0; s->input.ly = 0; }
+    else { s->input.rx = 0; s->input.ry = 0; }
+    SDL_UnlockMutex(s->lock);
+    nap(L, s, 0.05);
   }
   return 0;
 }
 
-// type("hello\n") - queued to the keyboard; waits roughly as long as typing takes.
+// type("hello\n")
 static int l_type(lua_State *L)
 {
   struct script *s = self(L);
-  size_t n;
-  const char *t = luaL_checklstring(L, 1, &n);
-  pthread_mutex_lock(&s->lock);
-  size_t room = sizeof s->textq - 1 - s->textq_len;
-  if (n > room) n = room;
-  memcpy(s->textq + s->textq_len, t, n);
+  const char *str = luaL_checkstring(L, 1);
+  SDL_LockMutex(s->lock);
+  size_t cap = sizeof s->textq - s->textq_len;
+  size_t n = strlen(str);
+  if (n > cap) n = cap;
+  memcpy(s->textq + s->textq_len, str, n);
   s->textq_len += n;
-  pthread_mutex_unlock(&s->lock);
-  nap(L, s, 0.1 + n / (double)SV_TEXT_CHARS_PER_SEC);
+  SDL_UnlockMutex(s->lock);
   return 0;
 }
 
-// key("capslock" | "enter" | "esc" | "backspace" | "tab" | "up" | "down" |
-//     "left" | "right") - press one non-printing key on the keyboard.
+// Special keys on the keyboard interface: key("enter"), key("esc"), key("up"), etc.
+static const struct { const char *name; uint8_t byte; } KEYS[] = {
+  {"enter", '\n'}, {"return", '\n'}, {"esc", 0x1b}, {"escape", 0x1b},
+  {"backspace", '\b'}, {"tab", '\t'}, {"capslock", 0x11}, {"caps", 0x11},
+  {"up", 0x12}, {"down", 0x13}, {"left", 0x14}, {"right", 0x15},
+};
+
 static int l_key(lua_State *L)
 {
-  static const struct { const char *name; char ch; } KEYS[] = {
-    {"capslock", SV_KEY_CAPSLOCK}, {"enter", '\n'}, {"esc", 27}, {"backspace", '\b'},
-    {"tab", '\t'}, {"up", SV_KEY_UP}, {"down", SV_KEY_DOWN}, {"left", SV_KEY_LEFT},
-    {"right", SV_KEY_RIGHT},
-  };
   struct script *s = self(L);
   const char *n = luaL_checkstring(L, 1);
+  uint8_t byte = 0;
   for (unsigned k = 0; k < sizeof KEYS / sizeof KEYS[0]; k++)
     if (!strcasecmp(n, KEYS[k].name)) {
-      pthread_mutex_lock(&s->lock);
-      if (s->textq_len + 1 < sizeof s->textq) s->textq[s->textq_len++] = KEYS[k].ch;
-      pthread_mutex_unlock(&s->lock);
-      nap(L, s, 0.25);
-      return 0;
+      byte = KEYS[k].byte;
+      break;
     }
-  return luaL_error(L, "unknown key '%s'", n);
+  if (!byte) return luaL_error(L, "unknown key '%s'", n);
+  SDL_LockMutex(s->lock);
+  if (s->textq_len < sizeof s->textq) s->textq[s->textq_len++] = (char)byte;
+  SDL_UnlockMutex(s->lock);
+  return 0;
 }
 
-// capslock() -> true/false from the console's keyboard LED, nil if unknown.
+// capslock(0) ensures Caps Lock is off; capslock(1) ensures it's on; capslock()
+// returns the current state (true/false, or nil if not yet reported by Pico).
 static int l_capslock(lua_State *L)
 {
-  int leds = atomic_load(&self(L)->leds);
-  if (leds < 0) lua_pushnil(L); else lua_pushboolean(L, leds & SV_LED_CAPSLOCK);
-  return 1;
+  struct script *s = self(L);
+  int leds = atomic_load(&s->leds);
+  if (lua_gettop(L) == 0) {
+    if (leds < 0) lua_pushnil(L);
+    else lua_pushboolean(L, (leds & SV_LED_CAPSLOCK) != 0);
+    return 1;
+  }
+  int want = lua_toboolean(L, 1);
+  // Wait up to 1 s for a link LED report so we don't toggle blindly.
+  uint32_t deadline = SDL_GetTicks() + 1000;
+  while (leds < 0 && (int32_t)(deadline - SDL_GetTicks()) > 0) {
+    nap(L, s, 0.05);
+    leds = atomic_load(&s->leds);
+  }
+  if (leds < 0) {
+    logf_(s, "capslock: host LED status unknown, toggling once");
+    SDL_LockMutex(s->lock);
+    if (s->textq_len < sizeof s->textq) s->textq[s->textq_len++] = 0x11;
+    SDL_UnlockMutex(s->lock);
+    return 0;
+  }
+  int cur = (leds & SV_LED_CAPSLOCK) != 0;
+  if (cur != want) {
+    logf_(s, "capslock: %s -> %s", cur ? "ON" : "off", want ? "ON" : "off");
+    SDL_LockMutex(s->lock);
+    if (s->textq_len < sizeof s->textq) s->textq[s->textq_len++] = 0x11;
+    SDL_UnlockMutex(s->lock);
+    // Give the toggle a moment to round-trip through the Switch -> Pico -> link.
+    nap(L, s, 0.15);
+  }
+  return 0;
 }
 
-// text() -> OCR text of a frame captured after this call.
+// text() -> latest raw OCR text (lower-case, collapsed whitespace)
 static int l_text(lua_State *L)
 {
-  struct script *s = self(L);
   char buf[8192];
-  fresh_text(L, s, SDL_GetTicks(), buf, sizeof buf);
+  fresh_text(L, self(L), SDL_GetTicks(), buf, sizeof buf);
   lua_pushstring(L, buf);
   return 1;
 }
 
-// screen() -> label of the current screen per the rules.
+// screen() -> current screen label under the rules
 static int l_screen(lua_State *L)
 {
   struct script *s = self(L);
@@ -329,123 +389,118 @@ static int l_screen(lua_State *L)
   return 1;
 }
 
-static int label_in(lua_State *L, int idx, const char *label)
-{
-  if (lua_type(L, idx) == LUA_TTABLE) {
-    for (lua_Integer i = 1;; i++) {
-      lua_rawgeti(L, idx, i);
-      if (lua_isnil(L, -1)) { lua_pop(L, 1); return 0; }
-      int hit = !strcmp(lua_tostring(L, -1), label);
-      lua_pop(L, 1);
-      if (hit) return 1;
-    }
-  }
-  // "menu,dialog"
-  const char *list = luaL_checkstring(L, idx);
-  size_t ln = strlen(label);
-  for (const char *p = list; *p;) {
-    while (*p == ',' || *p == ' ') p++;
-    const char *e = p;
-    while (*e && *e != ',') e++;
-    const char *t = e;
-    while (t > p && t[-1] == ' ') t--;
-    if ((size_t)(t - p) == ln && !strncmp(p, label, ln)) return 1;
-    p = e;
-  }
-  return 0;
-}
-
-// wait("menu,dialog" | {"menu","dialog"}, timeout=30) -> label or nil
+// wait("screen_label" [, timeout_s]) -> true or false
+// wait({"label1", "label2"} [, timeout_s]) -> matched label or nil
 static int l_wait(lua_State *L)
 {
   struct script *s = self(L);
-  double timeout = luaL_optnumber(L, 2, 30);
+  double timeout = 10.0;
+  int top = lua_gettop(L);
+  if (top >= 2 && lua_type(L, top) == LUA_TNUMBER) timeout = lua_tonumber(L, top);
+
   uint32_t end = SDL_GetTicks() + (uint32_t)(timeout * 1000);
   char buf[8192];
-  unsigned last = 0;
   while ((int32_t)(end - SDL_GetTicks()) > 0) {
-    unsigned seq = ocr_latest(s->ocr, buf, sizeof buf, NULL);
-    if (seq && seq != last) {
-      last = seq;
-      const char *label = classify(s, buf);
-      if (label_in(L, 1, label)) { lua_pushstring(L, label); return 1; }
+    uint32_t req = SDL_GetTicks();
+    fresh_text(L, s, req, buf, sizeof buf);
+    const char *label = classify(s, buf);
+
+    if (lua_type(L, 1) == LUA_TSTRING) {
+      if (!strcmp(label, lua_tostring(L, 1))) { lua_pushboolean(L, 1); return 1; }
+    } else if (lua_type(L, 1) == LUA_TTABLE) {
+      int len = (int)lua_rawlen(L, 1);
+      for (int i = 1; i <= len; i++) {
+        lua_rawgeti(L, 1, i);
+        const char *cand = lua_tostring(L, -1);
+        int hit = cand && !strcmp(label, cand);
+        lua_pop(L, 1);
+        if (hit) { lua_pushstring(L, label); return 1; }
+      }
     }
-    nap(L, s, 0.02);
+    nap(L, s, 0.05);
   }
-  lua_pushnil(L);
+  if (lua_type(L, 1) == LUA_TTABLE) lua_pushnil(L);
+  else lua_pushboolean(L, 0);
   return 1;
 }
 
-// find("word", timeout=0) -> true if the word (spaces ignored) is on screen.
+// find("word") -> true if word is on screen right now
+// find({"word1", "word2"}) -> true if ALL words appear on screen
 static int l_find(lua_State *L)
 {
   struct script *s = self(L);
-  char want[256], buf[8192], sq[8192];
-  squash(luaL_checkstring(L, 1), want, sizeof want);
-  for (char *c = want; *c; c++) *c = (char)tolower((unsigned char)*c);
-  double timeout = luaL_optnumber(L, 2, 0);
-  uint32_t end = SDL_GetTicks() + (uint32_t)(timeout * 1000);
-  pthread_mutex_lock(&s->lock);
-  snprintf(s->hl[0], sizeof s->hl[0], "%.63s", want);
-  s->nhl = 1;
-  pthread_mutex_unlock(&s->lock);
+  char buf[8192], squashed[8192];
   fresh_text(L, s, SDL_GetTicks(), buf, sizeof buf);
-  for (;;) {
-    squash(buf, sq, sizeof sq);
-    if (strstr(sq, want)) { lua_pushboolean(L, 1); return 1; }
-    if ((int32_t)(end - SDL_GetTicks()) <= 0) break;
-    fresh_text(L, s, SDL_GetTicks(), buf, sizeof buf);
+  squash(buf, squashed, sizeof squashed);
+
+  int ok = 1;
+  SDL_LockMutex(s->lock);
+  s->nhl = 0;
+  if (lua_type(L, 1) == LUA_TSTRING) {
+    char word[64];
+    squash(lua_tostring(L, 1), word, sizeof word);
+    for (char *p = word; *p; p++) *p = (char)tolower((unsigned char)*p);
+    ok = strstr(squashed, word) != NULL;
+    if (ok) { snprintf(s->hl[0], sizeof s->hl[0], "%s", word); s->nhl = 1; }
+  } else if (lua_type(L, 1) == LUA_TTABLE) {
+    int len = (int)lua_rawlen(L, 1);
+    for (int i = 1; i <= len; i++) {
+      lua_rawgeti(L, 1, i);
+      char word[64];
+      squash(lua_tostring(L, -1), word, sizeof word);
+      for (char *p = word; *p; p++) *p = (char)tolower((unsigned char)*p);
+      lua_pop(L, 1);
+      if (!strstr(squashed, word)) ok = 0;
+      if (s->nhl < MAX_RULE_WORDS) snprintf(s->hl[s->nhl++], sizeof s->hl[0], "%s", word);
+    }
   }
-  lua_pushboolean(L, 0);
+  if (!ok) s->nhl = 0;
+  SDL_UnlockMutex(s->lock);
+  lua_pushboolean(L, ok);
   return 1;
 }
 
-static void add_rule(lua_State *L, struct script *s, const char *label, int words_idx, int first_word)
-{
-  struct rule r = {0};
-  snprintf(r.label, sizeof r.label, "%s", label);
-  if (words_idx) {
-    for (lua_Integer i = 1; r.nwords < MAX_RULE_WORDS; i++) {
-      lua_rawgeti(L, words_idx, i);
-      if (lua_isnil(L, -1)) { lua_pop(L, 1); break; }
-      squash(lua_tostring(L, -1), r.words[r.nwords], sizeof r.words[0]);
-      r.nwords++;
-      lua_pop(L, 1);
-    }
-  } else {
-    for (int i = first_word; i <= lua_gettop(L) && r.nwords < MAX_RULE_WORDS; i++)
-      squash(luaL_checkstring(L, i), r.words[r.nwords++], sizeof r.words[0]);
-  }
-  for (int w = 0; w < r.nwords; w++)
-    for (char *c = r.words[w]; *c; c++) *c = (char)tolower((unsigned char)*c);
-  pthread_mutex_lock(&s->lock);
-  if (s->nrules < MAX_RULES) s->rules[s->nrules++] = r;
-  pthread_mutex_unlock(&s->lock);
-}
-
-// rule("menu", "press start", ...) - checked in the order added.
+// rule("home", "nintendo", "switch", "online")
 static int l_rule(lua_State *L)
 {
-  add_rule(L, self(L), luaL_checkstring(L, 1), 0, 2);
+  struct script *s = self(L);
+  int n = lua_gettop(L);
+  if (n < 2) return luaL_error(L, "rule(label, word1, ...)");
+  SDL_LockMutex(s->lock);
+  if (s->nrules >= MAX_RULES) {
+    SDL_UnlockMutex(s->lock);
+    return luaL_error(L, "too many rules");
+  }
+  struct rule *r = &s->rules[s->nrules++];
+  snprintf(r->label, sizeof r->label, "%s", luaL_checkstring(L, 1));
+  r->nwords = 0;
+  for (int i = 2; i <= n && r->nwords < MAX_RULE_WORDS; i++) {
+    char word[64];
+    squash(luaL_checkstring(L, i), word, sizeof word);
+    for (char *p = word; *p; p++) *p = (char)tolower((unsigned char)*p);
+    snprintf(r->words[r->nwords++], sizeof r->words[0], "%s", word);
+  }
+  SDL_UnlockMutex(s->lock);
   return 0;
 }
 
-// rules{ menu = {"press start"}, dialog = {"are you sure"} } - unordered.
+// rules{ home = {"nintendo", "switch"}, user_picker = "who is playing" }
 static int l_rules(lua_State *L)
 {
-  struct script *s = self(L);
   luaL_checktype(L, 1, LUA_TTABLE);
   lua_pushnil(L);
   while (lua_next(L, 1)) {
-    if (lua_type(L, -2) == LUA_TSTRING) {
-      if (lua_istable(L, -1)) add_rule(L, s, lua_tostring(L, -2), lua_gettop(L), 0);
-      else if (lua_type(L, -1) == LUA_TSTRING) {
-        lua_newtable(L);
-        lua_pushvalue(L, -2);
-        lua_rawseti(L, -2, 1);
-        add_rule(L, s, lua_tostring(L, -3), lua_gettop(L), 0);
-        lua_pop(L, 1);
-      }
+    const char *label = lua_tostring(L, -2);
+    if (!label) { lua_pop(L, 1); continue; }
+    lua_getglobal(L, "rule");
+    lua_pushstring(L, label);
+    if (lua_type(L, -3) == LUA_TTABLE) {
+      int len = (int)lua_rawlen(L, -3);
+      for (int i = 1; i <= len; i++) lua_rawgeti(L, -3 - i, i);
+      lua_call(L, len + 1, 0);
+    } else {
+      lua_pushvalue(L, -3);
+      lua_call(L, 2, 0);
     }
     lua_pop(L, 1);
   }
@@ -472,13 +527,13 @@ static void stop_hook(lua_State *L, lua_Debug *ar)
 
 static void clear_input(struct script *s)
 {
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   memset(&s->input, 0, sizeof s->input);
   s->input.hat = SV_HAT_CENTER;
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
 }
 
-static void *script_thread(void *arg)
+static int SDLCALL script_thread(void *arg)
 {
   struct script *s = arg;
   lua_State *L = luaL_newstate();
@@ -510,7 +565,7 @@ static void *script_thread(void *arg)
   ocr_set_enabled(s->ocr, 0);
   ocr_set_region(s->ocr, 0, 0, 0, 0);
   atomic_store(&s->running, 0);
-  return NULL;
+  return 0;
 }
 
 /* ---------------- public ---------------- */
@@ -535,9 +590,10 @@ void script_rescan(struct script *s)
 struct script *script_create(struct ocr *ocr, const char *dir)
 {
   struct script *s = calloc(1, sizeof *s);
+  if (!s) return NULL;
   s->ocr = ocr;
   snprintf(s->dir, sizeof s->dir, "%s", dir);
-  pthread_mutex_init(&s->lock, NULL);
+  s->lock = SDL_CreateMutex();
   s->input.hat = SV_HAT_CENTER;
   atomic_store(&s->leds, -1);
   script_rescan(s);
@@ -548,7 +604,7 @@ void script_destroy(struct script *s)
 {
   if (!s) return;
   script_stop(s);
-  pthread_mutex_destroy(&s->lock);
+  if (s->lock) SDL_DestroyMutex(s->lock);
   free(s);
 }
 
@@ -558,23 +614,24 @@ const char *script_name(struct script *s, int i) { return i >= 0 && i < s->count
 int script_start(struct script *s, int index)
 {
   if (atomic_load(&s->running) || index < 0 || index >= s->count || !s->ocr) return -1;
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   snprintf(s->path, sizeof s->path, "%s/%s", s->dir, s->names[index]);
   s->nrules = 0;
   s->nhl = 0;
   s->screen[0] = 0;
   s->textq_len = 0;
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
   clear_input(s);
   atomic_store(&s->stop, 0);
   atomic_store(&s->running, 1);
   ocr_set_enabled(s->ocr, 1);
-  if (pthread_create(&s->th, NULL, script_thread, s) != 0) {
+  s->th = SDL_CreateThread(script_thread, "script", s);
+  if (!s->th) {
     atomic_store(&s->running, 0);
     ocr_set_enabled(s->ocr, 0);
     return -1;
   }
-  pthread_detach(s->th);
+  SDL_DetachThread(s->th);
   return 0;
 }
 
@@ -582,55 +639,55 @@ void script_stop(struct script *s)
 {
   if (!atomic_load(&s->running)) return;
   atomic_store(&s->stop, 1);
-  for (int i = 0; i < 200 && atomic_load(&s->running); i++) usleep(5000);
+  for (int i = 0; i < 200 && atomic_load(&s->running); i++) sv_usleep(5000);
 }
 
 int script_running(struct script *s) { return atomic_load(&s->running); }
 
 void script_get_input(struct script *s, struct link_state *out, int *active)
 {
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   *out = s->input;
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
   *active = atomic_load(&s->running);
 }
 
 int script_take_text(struct script *s, char *buf, size_t len)
 {
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   size_t n = s->textq_len < len - 1 ? s->textq_len : len - 1;
   memcpy(buf, s->textq, n);
   buf[n] = 0;
   memmove(s->textq, s->textq + n, s->textq_len - n);
   s->textq_len -= n;
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
   return n > 0;
 }
 
 void script_screen(struct script *s, char *buf, size_t len)
 {
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   snprintf(buf, len, "%s", s->screen);
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
 }
 
 int script_log(struct script *s, char lines[][SCRIPT_LOG_COLS], int max)
 {
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   int n = s->log_count < max ? s->log_count : max;
   int start = s->log_head + s->log_count - n;
   for (int i = 0; i < n; i++)
     memcpy(lines[i], s->log[(start + i) % SCRIPT_LOG_LINES], SCRIPT_LOG_COLS);
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
   return n;
 }
 
 int script_highlights(struct script *s, char words[][64], int max)
 {
-  pthread_mutex_lock(&s->lock);
+  SDL_LockMutex(s->lock);
   int n = s->nhl < max ? s->nhl : max;
   memcpy(words, s->hl, sizeof words[0] * (size_t)n);
-  pthread_mutex_unlock(&s->lock);
+  SDL_UnlockMutex(s->lock);
   return n;
 }
 

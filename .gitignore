@@ -1,5 +1,7 @@
 app/*.o
 app/switchview
+app/switchview.exe
+*.exe
 firmware/build/
 firmware/secrets.cmake
 app/fonts/*.ttf

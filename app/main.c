@@ -1,13 +1,28 @@
 // SwitchView: low-latency Elgato capture viewer + Pro Controller / keyboard
 // command panel driving a Pico 2 W that is plugged into the Switch 2 dock.
 #include <SDL2/SDL.h>
-#include <linux/videodev2.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if __has_include("compat/platform.h")
+#include "compat/platform.h"
+#else
+#include "platform.h"
+#endif
+
+#if __has_include("compat/dirent.h")
+#include "compat/dirent.h"
+#else
+#include "dirent.h"
+#endif
+
+#include <getopt.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "capture.h"
 #include "link.h"
@@ -23,8 +38,8 @@ static void usage(const char *argv0)
 {
   fprintf(stderr,
           "usage: %s [options]\n"
-          "  -d DEV     video device (default /dev/video0)\n"
-          "  -a PCM     ALSA capture device (default hw:CARD=S,DEV=0)\n"
+          "  -d DEV     video device (default /dev/video0 or test)\n"
+          "  -a PCM     audio capture device (default hw:CARD=S,DEV=0 or default)\n"
           "  -s WxH     capture size (default 1920x1080)\n"
           "  -r FPS     frame rate (default 60)\n"
           "  -p FMT     pixel format: nv12 | yuyv (default nv12)\n"
@@ -46,9 +61,17 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
+  sv_net_init();
+
+#ifdef _WIN32
+  struct capture_opts co = {.video_dev = "test", .audio_dev = "default",
+                            .width = 1920, .height = 1080, .fps = 60,
+                            .fourcc = V4L2_PIX_FMT_NV12, .audio_max_ms = 20};
+#else
   struct capture_opts co = {.video_dev = "/dev/video0", .audio_dev = "hw:CARD=S,DEV=0",
                             .width = 1920, .height = 1080, .fps = 60,
                             .fourcc = V4L2_PIX_FMT_NV12, .audio_max_ms = 20};
+#endif
   const char *host = "192.168.4.60";
   int port = SV_PORT, vsync = 0, fullscreen = 0, verbose = 0;
   float mouse_scale = 1.0f;
@@ -57,7 +80,7 @@ int main(int argc, char **argv)
     switch (c) {
     case 'd': co.video_dev = optarg; break;
     case 'a': co.audio_dev = optarg; break;
-    case 's': if (sscanf(optarg, "%dx%d", &co.width, &co.height) != 2) { usage(argv[0]); return 1; } break;
+    case 's': if (sscanf(optarg, "%dx%d", &co.width, &co.height) != 2) { usage(argv[0]); sv_net_cleanup(); return 1; } break;
     case 'r': co.fps = atoi(optarg); break;
     case 'p': co.fourcc = !strcmp(optarg, "yuyv") ? V4L2_PIX_FMT_YUYV : V4L2_PIX_FMT_NV12; break;
     case 'l': co.audio_max_ms = atoi(optarg); break;
@@ -68,7 +91,7 @@ int main(int argc, char **argv)
     case 'f': fullscreen = 1; break;
     case 'n': co.no_audio = 1; break;
     case 'V': verbose = 1; break;
-    default: usage(argv[0]); return c != 'h';
+    default: usage(argv[0]); sv_net_cleanup(); return c != 'h';
     }
   }
 
@@ -81,6 +104,7 @@ int main(int argc, char **argv)
   SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "1");
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0) {
     fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+    sv_net_cleanup();
     return 1;
   }
 
@@ -89,23 +113,45 @@ int main(int argc, char **argv)
                                      (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
   SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED |
                                          (vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
-  if (!win || !ren) { fprintf(stderr, "SDL window/renderer: %s\n", SDL_GetError()); return 1; }
+  if (!win || !ren) {
+    fprintf(stderr, "SDL window/renderer: %s\n", SDL_GetError());
+    SDL_Quit();
+    sv_net_cleanup();
+    return 1;
+  }
   SDL_RendererInfo ri;
   SDL_GetRendererInfo(ren, &ri);
   fprintf(stderr, "render: %s, vsync %s\n", ri.name, vsync ? "on" : "off");
 
   struct capture *cap = capture_open(&co, ren);
-  if (!cap) return 1;
+  if (!cap) {
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    sv_net_cleanup();
+    return 1;
+  }
   struct link *link = strcmp(host, "none") ? link_open(host, port) : NULL;
   struct panel *panel = panel_create(ren);
 
   // Scripts live in SwitchView/scripts, next to app/ where the binary is.
-  char script_dir[1024] = "scripts";
-  ssize_t en = readlink("/proc/self/exe", script_dir, sizeof script_dir - 16);
-  if (en > 0) {
-    script_dir[en] = 0;
-    char *slash = strrchr(script_dir, '/');
-    if (slash) strcpy(slash + 1, "../scripts");
+  char script_dir[1200] = "scripts";
+  char exe_dir[1024];
+  if (sv_get_executable_dir(exe_dir, sizeof(exe_dir) - 32) == 0) {
+    char test_dir[1200];
+    snprintf(test_dir, sizeof(test_dir), "%s/scripts", exe_dir);
+    DIR *d = opendir(test_dir);
+    if (d) {
+      closedir(d);
+      snprintf(script_dir, sizeof(script_dir), "%s", test_dir);
+    } else {
+      snprintf(test_dir, sizeof(test_dir), "%s/../scripts", exe_dir);
+      d = opendir(test_dir);
+      if (d) {
+        closedir(d);
+        snprintf(script_dir, sizeof(script_dir), "%s", test_dir);
+      }
+    }
   }
   struct ocr *ocr = ocr_create(cap);
   struct script *script = script_create(ocr, script_dir);
@@ -283,5 +329,6 @@ int main(int argc, char **argv)
   SDL_DestroyRenderer(ren);
   SDL_DestroyWindow(win);
   SDL_Quit();
+  sv_net_cleanup();
   return 0;
 }

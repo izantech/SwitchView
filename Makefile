@@ -2,21 +2,33 @@
 # Pico 2 W firmware (firmware/), shared wire protocol (proto/).
 
 CFLAGS ?= -O2 -Wall -Wextra
-PKGS = sdl2 SDL2_ttf alsa tesseract lua5.4
 PICO_SDK_PATH ?= $(HOME)/Development/pico-sdk
 USB_LAYOUT ?= 1        # 0 controller only, 1 controller + keyboard, 2 keyboard only
 
-APP = app/switchview
+ifeq ($(OS),Windows_NT)
+  APP = app/switchview.exe
+  PKGS = sdl2 SDL2_ttf lua
+  EXTRA_LIBS = -mconsole -lws2_32 -lole32 -lmf -lmfplat -lmfreadwrite -lmfuuid -lm
+  EXTRA_CFLAGS =
+  RM = rm -f
+else
+  APP = app/switchview
+  PKGS = sdl2 SDL2_ttf alsa tesseract lua5.4
+  EXTRA_LIBS = -lpthread -lm
+  EXTRA_CFLAGS = -DHAVE_TESSERACT
+  RM = rm -f
+endif
+
 SRCS = app/main.c app/capture.c app/panel.c app/link.c app/ocr.c app/script.c
 OBJS = $(SRCS:.c=.o)
 
 all: $(APP)
 
 $(APP): $(OBJS)
-	$(CC) $(CFLAGS) $(OBJS) -o $@ $$(pkg-config --libs $(PKGS)) -lpthread -lm
+	$(CC) $(CFLAGS) $(OBJS) -o $@ $$(pkg-config --libs $(PKGS)) $(EXTRA_LIBS)
 
 app/%.o: app/%.c app/*.h proto/switchview_proto.h
-	$(CC) $(CFLAGS) -Iproto $$(pkg-config --cflags $(PKGS)) -c $< -o $@
+	$(CC) $(CFLAGS) -Iproto -Icompat $(EXTRA_CFLAGS) $$(pkg-config --cflags $(PKGS)) -c $< -o $@
 
 run: $(APP)
 	./$(APP)
@@ -34,7 +46,7 @@ flash: firmware
 	cp firmware/build/pico_pro_controller.uf2 "$$vol/" && echo "flashed to $$vol"
 
 clean:
-	rm -f $(OBJS) $(APP)
+	$(RM) $(OBJS) $(APP)
 	rm -rf firmware/build
 
 .PHONY: all run firmware flash clean

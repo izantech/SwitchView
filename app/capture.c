@@ -1,5 +1,9 @@
 #include "capture.h"
 
+#ifdef _WIN32
+#include "capture_win.c"
+#else
+
 #include <alsa/asoundlib.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -208,7 +212,7 @@ struct capture *capture_open(const struct capture_opts *o, SDL_Renderer *ren)
   pthread_mutex_init(&c->luma_lock, NULL);
   if (video_open(c, o) < 0) { capture_close(c); return NULL; }
 
-  Uint32 tex_fmt = c->fourcc == V4L2_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12 : SDL_PIXELFORMAT_YUY2;
+  Uint32 tex_fmt = c->fourcc == SV_FMT_NV12 ? SDL_PIXELFORMAT_NV12 : SDL_PIXELFORMAT_YUY2;
   c->tex = SDL_CreateTexture(ren, tex_fmt, SDL_TEXTUREACCESS_STREAMING, (int)c->width, (int)c->height);
   if (!c->tex) { fprintf(stderr, "SDL texture: %s\n", SDL_GetError()); capture_close(c); return NULL; }
   SDL_SetYUVConversionMode(c->height > 576 ? SDL_YUV_CONVERSION_BT709 : SDL_YUV_CONVERSION_BT601);
@@ -252,13 +256,13 @@ int capture_poll(struct capture *c, int timeout_ms)
     for (unsigned y = 0; y < c->height; y++) {
       const Uint8 *row = p + (size_t)y * c->stride;
       uint8_t *out = c->luma + (size_t)y * c->width;
-      if (c->fourcc == V4L2_PIX_FMT_NV12) memcpy(out, row, c->width);
+      if (c->fourcc == SV_FMT_NV12) memcpy(out, row, c->width);
       else for (unsigned x = 0; x < c->width; x++) out[x] = row[2 * x];  // YUYV
     }
     c->luma_seq++;
     pthread_mutex_unlock(&c->luma_lock);
   }
-  if (c->fourcc == V4L2_PIX_FMT_NV12)
+  if (c->fourcc == SV_FMT_NV12)
     SDL_UpdateNVTexture(c->tex, NULL, p, (int)c->stride, p + c->stride * c->height, (int)c->stride);
   else
     SDL_UpdateTexture(c->tex, NULL, p, (int)c->stride);
@@ -293,3 +297,5 @@ unsigned capture_copy_luma(struct capture *c, uint8_t *dst)
   pthread_mutex_unlock(&c->luma_lock);
   return seq;
 }
+
+#endif // !_WIN32

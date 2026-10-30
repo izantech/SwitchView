@@ -2,13 +2,21 @@
 #include "switchview_proto.h"
 #include "script.h"
 
+#if __has_include("compat/platform.h")
+#include "compat/platform.h"
+#else
+#include "platform.h"
+#endif
+
 #include <SDL2/SDL_ttf.h>
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 /* ---------------- layout ---------------- */
 
@@ -132,20 +140,31 @@ struct panel {
 static TTF_Font *open_font(int px, int bold)
 {
   char bundled[1024];
-  ssize_t n = readlink("/proc/self/exe", bundled, sizeof bundled - 40);
-  if (n > 0) {
-    bundled[n] = 0;
-    char *slash = strrchr(bundled, '/');
-    if (slash) strcpy(slash + 1, "fonts/NintendoNTLG-DB.ttf");
-    TTF_Font *f = TTF_OpenFont(bundled, px);
+  if (sv_get_executable_dir(bundled, sizeof(bundled) - 40) == 0) {
+    char font_path[1200];
+    snprintf(font_path, sizeof(font_path), "%s/fonts/NintendoNTLG-DB.ttf", bundled);
+    TTF_Font *f = TTF_OpenFont(font_path, px);
+    if (!f) {
+      snprintf(font_path, sizeof(font_path), "%s/../fonts/NintendoNTLG-DB.ttf", bundled);
+      f = TTF_OpenFont(font_path, px);
+    }
     if (f) { TTF_SetFontHinting(f, TTF_HINTING_LIGHT); return f; }
   }
+#ifdef _WIN32
+  const char *paths_b[] = {"C:\\Windows\\Fonts\\segoeui.ttf",
+                           "C:\\Windows\\Fonts\\arial.ttf",
+                           "C:\\Windows\\Fonts\\consola.ttf"};
+  const char *paths_r[] = {"C:\\Windows\\Fonts\\segoeui.ttf",
+                           "C:\\Windows\\Fonts\\arial.ttf",
+                           "C:\\Windows\\Fonts\\consola.ttf"};
+#else
   const char *paths_b[] = {"/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
                            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
                            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"};
   const char *paths_r[] = {"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
                            "/usr/share/fonts/truetype/noto/NotoSans-Medium.ttf",
                            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"};
+#endif
   const char **paths = bold ? paths_b : paths_r;
   for (int i = 0; i < 3; i++) {
     TTF_Font *f = TTF_OpenFont(paths[i], px);
@@ -396,7 +415,12 @@ struct panel *panel_create(SDL_Renderer *ren)
   if (TTF_Init() == 0) {
     p->font_big = open_font(21, 1);
     p->font_small = open_font(12, 0);
+#ifdef _WIN32
+    p->font_sym = TTF_OpenFont("C:\\Windows\\Fonts\\segoeui.ttf", 19);
+    if (!p->font_sym) p->font_sym = TTF_OpenFont("C:\\Windows\\Fonts\\arial.ttf", 19);
+#else
     p->font_sym = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 19);
+#endif
     if (p->font_sym) TTF_SetFontHinting(p->font_sym, TTF_HINTING_LIGHT);
     if (!p->font_big) fprintf(stderr, "panel: no TTF font found; labels disabled\n");
   }

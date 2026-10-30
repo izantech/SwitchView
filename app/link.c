@@ -1,20 +1,24 @@
 #include "link.h"
 #include "switchview_proto.h"
+#if __has_include("compat/platform.h")
+#include "compat/platform.h"
+#else
+#include "platform.h"
+#endif
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <errno.h>
+
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0
+#endif
 
 #define KEEPALIVE_MS 20   // 50 Hz state refresh while idle
 #define PING_MS 500       // link-health probe interval
 #define UP_TIMEOUT_MS 2000
 #define RESOCKET_MS 5000  // no echo for this long: rebuild the socket (interface may have changed)
-#include <errno.h>
-#include <fcntl.h>
 
 // Text pacing: the firmware types ~10 chars/s from a 255-byte queue. A token
 // bucket lets single keystrokes go out instantly while long pastes never
@@ -22,7 +26,7 @@
 #define TEXT_BUCKET_MAX 200.0f
 
 struct link {
-  int fd;
+  sv_socket_t fd;
   struct sockaddr_in dst;
   char desc[64];
   struct link_state cur;
@@ -36,23 +40,24 @@ struct link {
   struct link_stats st;
 };
 
-static int open_socket(void)
+static sv_socket_t open_socket(void)
 {
-  int fd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (fd >= 0) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+  sv_socket_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd != SV_INVALID_SOCKET) sv_set_nonblocking(fd);
   return fd;
 }
 
 struct link *link_open(const char *host, int port)
 {
   struct link *l = calloc(1, sizeof *l);
+  if (!l) return NULL;
   l->fd = open_socket();
-  if (l->fd < 0) { perror("socket"); free(l); return NULL; }
+  if (l->fd == SV_INVALID_SOCKET) { perror("socket"); free(l); return NULL; }
   l->dst.sin_family = AF_INET;
   l->dst.sin_port = htons((uint16_t)port);
   if (inet_pton(AF_INET, host, &l->dst.sin_addr) != 1) {
     fprintf(stderr, "link: bad host %s\n", host);
-    close(l->fd);
+    sv_close_socket(l->fd);
     free(l);
     return NULL;
   }
@@ -71,13 +76,13 @@ void link_close(struct link *l)
   struct link_state zero = {.hat = SV_HAT_CENTER};
   link_set_state(l, &zero);
   link_poll(l, l->last_state_ms + KEEPALIVE_MS + 1);
-  close(l->fd);
+  sv_close_socket(l->fd);
   free(l);
 }
 
 static void send_packet(struct link *l, const sv_packet *p)
 {
-  if (sendto(l->fd, p, SV_PACKET_SIZE, MSG_DONTWAIT, (struct sockaddr *)&l->dst, sizeof l->dst) < 0)
+  if (sendto(l->fd, (const char *)p, SV_PACKET_SIZE, MSG_DONTWAIT, (struct sockaddr *)&l->dst, sizeof l->dst) < 0)
     l->st.send_errors++;
   else
     l->st.packets++;
@@ -156,7 +161,7 @@ void link_poll(struct link *l, uint32_t now_ms)
   sv_packet in;
   struct sockaddr_in from;
   socklen_t fl = sizeof from;
-  while (recvfrom(l->fd, &in, sizeof in, MSG_DONTWAIT, (struct sockaddr *)&from, &fl) >= SV_PACKET_SIZE) {
+  while (recvfrom(l->fd, (char *)&in, sizeof in, MSG_DONTWAIT, (struct sockaddr *)&from, &fl) >= SV_PACKET_SIZE) {
     if (in.magic[0] == SV_MAGIC0 && in.magic[1] == SV_MAGIC1 && in.type == SV_PKT_PING) {
       l->last_echo_ms = now_ms;
       l->st.rtt_ms = (float)(now_ms - in.buttons);
@@ -167,8 +172,8 @@ void link_poll(struct link *l, uint32_t now_ms)
   if (up != l->st.up) fprintf(stderr, "link: Pico %s\n", up ? "up" : "not answering");
   l->st.up = up;
   if (!up && now_ms - l->last_resocket_ms >= RESOCKET_MS) {
-    int fd = open_socket();
-    if (fd >= 0) { close(l->fd); l->fd = fd; }
+    sv_socket_t fd = open_socket();
+    if (fd != SV_INVALID_SOCKET) { sv_close_socket(l->fd); l->fd = fd; }
     l->last_resocket_ms = now_ms;
   }
 }
